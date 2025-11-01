@@ -2,7 +2,7 @@ name: 네이버 부동산 크롤링
 
 on:
   schedule:
-    # 매일 새벽 4시 (한국시간, UTC+9) = 전날 19:00 UTC
+    # 매일 새벽 4시 (한국시간 UTC+9 = 전날 19:00 UTC)
     - cron: '0 19 * * *'
   workflow_dispatch:
 
@@ -12,62 +12,51 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - name: 코드 체크아웃
-      uses: actions/checkout@v4
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
 
-    - name: Python 3.11 설정
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    - name: Python 의존성 설치
-      run: |
-        pip install -r requirements.txt
-        python -c "import sys; print('Python', sys.version)"
-        python - <<'PY'
-import importlib, sys
-for m in ['gspread','google.oauth2.service_account','playwright']:
-    try:
-        importlib.import_module(m)
-        print(m, 'OK')
-    except Exception as e:
-        print(m, 'NG:', e); sys.exit(1)
-PY
+      - name: Python 의존성 설치
+        run: |
+          pip install -r requirements.txt
+          python -c "import sys; print('Python', sys.version)"
 
-    - name: Playwright 브라우저 설치
-      run: |
-        playwright install chromium
-        playwright install-deps chromium
+      - name: Playwright 브라우저 설치
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
 
-    - name: 서비스 계정 키 생성+검증
-      env:
-        SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-      run: |
-        if [ -z "${SERVICE_ACCOUNT_JSON:-}" ]; then
-          echo "::error::Missing secret SERVICE_ACCOUNT_JSON"; exit 1;
-        fi
-        # heredoc 대신 printf로 안전하게 기록 (개행/따옴표 이슈 회피)
-        printf "%s" "$SERVICE_ACCOUNT_JSON" > service_account.json
-
-        python - <<'PY'
+      - name: 서비스 계정 키 생성 및 검증
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "${SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "::error::Missing secret SERVICE_ACCOUNT_JSON"; exit 1;
+          fi
+          printf "%s" "$SERVICE_ACCOUNT_JSON" > service_account.json
+          python - <<'PY'
 import json,sys
 try:
-    j=json.load(open('service_account.json','r',encoding='utf-8'))
-    for k in ('type','project_id','private_key','client_email'):
+    j=json.load(open("service_account.json","r",encoding="utf-8"))
+    for k in ("type","project_id","private_key","client_email"):
         assert k in j, f"missing {k}"
     print("service_account.json OK")
 except Exception as e:
     print(f"::error::service_account.json invalid: {e}")
     sys.exit(1)
 PY
-        ls -lh service_account.json
+          ls -lh service_account.json
 
-    - name: 스프레드시트 접근 프리플라이트
-      env:
-        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-      run: |
-        python - <<'PY'
+      - name: 스프레드시트 프리플라이트
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python - <<'PY'
 import os, sys, gspread
 from google.oauth2 import service_account
 sid = os.environ.get("SPREADSHEET_ID","").strip()
@@ -81,36 +70,35 @@ try:
         ss = gc.open_by_key(sid)
         try:
             ss.worksheet("네이버 관심지역")
-            print("✅ 프리플라이트: '네이버 관심지역' 탭 접근 OK")
+            print("✅ 프리플라이트: 탭 접근 OK")
         except gspread.WorksheetNotFound:
-            print("ℹ️ 프리플라이트: 워크시트 없음 → 실행 중 자동 생성 예정")
+            print("ℹ️ 탭 없음 → 실행 중 자동 생성")
     else:
-        print("::warning::SPREADSHEET_ID not set. 코드의 fallback ID 사용 예정")
+        print("⚠️ SPREADSHEET_ID 미설정 → fallback 사용")
 except Exception as e:
     print(f"::error::스프레드시트 접근 실패: {e}")
     sys.exit(1)
 PY
 
-    - name: 크롤링 실행
-      env:
-        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-        PYTHONUNBUFFERED: "1"
-        TZ: Asia/Seoul
-      run: |
-        set -o pipefail
-        python main_github.py 2>&1 | tee run.log
+      - name: 크롤링 실행
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PYTHONUNBUFFERED: "1"
+          TZ: Asia/Seoul
+        run: |
+          set -o pipefail
+          python main_github.py 2>&1 | tee run.log
 
-    - name: 결과/로그 업로드
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: results-${{ github.run_number }}
-        path: |
-          crawling_results.json
-          run.log
-        retention-days: 30
+      - name: 결과 및 로그 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ github.run_number }}
+          path: |
+            crawling_results.json
+            run.log
+          retention-days: 30
 
-    - name: 정리
-      if: always()
-      run: |
-        rm -f service_account.json
+      - name: 정리
+        if: always()
+        run: rm -f service_account.json
