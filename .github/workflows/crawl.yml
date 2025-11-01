@@ -24,14 +24,13 @@ jobs:
       - name: Python 의존성 설치
         run: |
           pip install -r requirements.txt
-          python -c "import sys; print('✅ Python', sys.version)"
 
       - name: Playwright 브라우저 설치
         run: |
           playwright install chromium
           playwright install-deps chromium
 
-      - name: 서비스 계정 키 생성 및 검증
+      - name: 서비스 계정 키 생성
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
         run: |
@@ -39,29 +38,8 @@ jobs:
             echo "::error::Missing secret SERVICE_ACCOUNT_JSON"; exit 1;
           fi
           printf "%s" "$SERVICE_ACCOUNT_JSON" > service_account.json
-          python -c "import json,sys; j=json.load(open('service_account.json')); \
-for k in ('type','project_id','private_key','client_email'): \
-  assert k in j, f'missing {k}'; print('✅ service_account.json OK')"
           ls -lh service_account.json
 
-      - name: 스프레드시트 프리플라이트
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-        run: |
-          python -c "import os,sys,gspread; \
-from google.oauth2 import service_account; \
-sid=os.environ.get('SPREADSHEET_ID','').strip(); \
-creds=service_account.Credentials.from_service_account_file('service_account.json',scopes=['https://www.googleapis.com/auth/spreadsheets']); \
-gc=gspread.authorize(creds); \
-print('🔍 프리플라이트 시작'); \
-import traceback; \
-try: \
-  ss=gc.open_by_key(sid) if sid else None; \
-  ws=ss.worksheet('네이버 관심지역') if ss else None; \
-  print('✅ 시트 접근 OK' if ws else 'ℹ️ 워크시트 없음→자동생성예정'); \
-except Exception as e: \
-  traceback.print_exc(); sys.exit(1)"
-          
       - name: 크롤링 실행
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -79,6 +57,7 @@ except Exception as e: \
           path: |
             crawling_results.json
             run.log
+          if-no-files-found: warn
           retention-days: 30
 
       - name: 정리
