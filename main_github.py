@@ -3,7 +3,7 @@
 GitHub Actions용 네이버 부동산 크롤러
 매일 자동으로 여러 단지의 매물 정보를 수집하여 Google Sheets의
 '네이버 관심지역' 탭에 기록합니다.
-(추출 흐름은 그대로. 접근 조건만 원본과 동일하게 조정)
+(추출 흐름 유지. '매물' 탭 클릭 실패여도 적극 스크롤로 수집 시도)
 """
 
 import asyncio
@@ -87,19 +87,78 @@ class AggressiveCardScroll:
         self.property_cards = []
         self.api_responses = []
         self.seen_article_nos = set()
-    
+
+    async def _aggressive_warm_scroll(self, page):
+        """매물탭 실패 시: 다양한 방법으로 강제 스크롤/포커스 → API 유도"""
+        print("  ↪ 매물 탭 실패: 적극 스크롤 워밍업 시작")
+
+        # 1) 키보드 스크롤(빠른 페이징 유도)
+        try:
+            for _ in range(3):
+                await page.keyboard.press("End")
+                await asyncio.sleep(0.6)
+            for _ in range(3):
+                await page.keyboard.press("PageDown")
+                await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+        # 2) 마우스 휠
+        try:
+            for _ in range(8):
+                await page.mouse.wheel(0, 1200)
+                await asyncio.sleep(0.25)
+        except Exception:
+            pass
+
+        # 3) 리스트 컨테이너 후보에 직접 스크롤 (가능한 셀렉터 폭넓게 시도)
+        candidates = [
+            "#listContents",
+            "div[class*=list]", "div[class*=sale]", "div[role='list']",
+            "section[class*=list]", "div[class*=item_list]",
+        ]
+        for sel in candidates:
+            try:
+                count = await page.locator(sel).count()
+                if count == 0:
+                    continue
+                # 여러 개면 앞쪽 몇 개만 시도
+                for idx in range(min(count, 3)):
+                    locator = page.locator(sel).nth(idx)
+                    await locator.evaluate(
+                        "(el) => { el.scrollTop = 0; }"
+                    )
+                    await asyncio.sleep(0.2)
+                    for _ in range(6):
+                        await locator.evaluate(
+                            "(el) => { el.scrollTop = el.scrollTop + el.clientHeight * 0.9; }"
+                        )
+                        await asyncio.sleep(0.35)
+                print(f"  ↪ 컨테이너 스크롤 시도: {sel}")
+            except Exception:
+                continue
+
+        # 4) 뷰포트 전체 스크롤(원본과 동일)
+        for _ in range(6):
+            try:
+                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+
+        print("  ↪ 적극 스크롤 워밍업 종료")
+
     async def run(self):
         """크롤링 실행"""
         async with async_playwright() as p:
-            # ▶ 원본과 접근 조건 일치: headful + 자동화 흔적 완화
+            # 원본과 유사한 접근 조건 (headful with Xvfb)
             browser = await p.chromium.launch(
-                headless=False,  # Xvfb로 headful 실행
+                headless=False,
                 args=["--disable-blink-features=AutomationControlled"]
             )
             context = await browser.new_context(
-                viewport={'width': 1366, 'height': 768},  # 일반 데스크톱 해상도
+                viewport={'width': 1366, 'height': 768},
                 user_agent=(
-                    # 로컬과 유사한 Windows Chrome/Edge UA (사람처럼 보이도록)
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0"
                 ),
@@ -110,13 +169,11 @@ class AggressiveCardScroll:
                     'Referer': 'https://new.land.naver.com/'
                 }
             )
-            # 자동화 흔적 축소
             await context.add_init_script("""
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR','ko']});
 Object.defineProperty(navigator, 'platform',  {get: () => 'Win32'});
             """)
-
             page = await context.new_page()
             
             # API 응답 캡처 (원본 그대로)
@@ -140,7 +197,7 @@ Object.defineProperty(navigator, 'platform',  {get: () => 'Win32'});
                         print(f"⚠️  API 응답 파싱 오류: {e}")
             page.on('response', handle_response)
             
-            # ▶ 원본과 동일 루트: 홈 워밍업 → 단지 진입, 대기는 DOM만
+            # 홈 워밍업 → 단지 진입
             try:
                 await page.goto("https://new.land.naver.com/", wait_until='domcontentloaded', timeout=60000)
                 await page.wait_for_load_state('networkidle', timeout=30000)
@@ -151,7 +208,7 @@ Object.defineProperty(navigator, 'platform',  {get: () => 'Win32'});
             url = f"https://new.land.naver.com/complexes/{self.complex_id}?ms=37.4779802,127.0413966,16&a=APT&b=A1&e=RETAIL"
             resp = await page.goto(url, wait_until='domcontentloaded', timeout=60000)
 
-            # 디버그(접근 결과만 기록, 추출 흐름은 그대로)
+            # 디버그(접근 결과만 기록)
             try:
                 ua = await page.evaluate("() => navigator.userAgent")
             except Exception:
@@ -173,28 +230,44 @@ Object.defineProperty(navigator, 'platform',  {get: () => 'Win32'});
             except Exception:
                 pass
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             
-            # ▼ 매물 탭 클릭 (원본 셀렉터 유지)
+            # 매물 탭 클릭 (실패해도 원본처럼 '적극 스크롤'로 바로 수집 시도)
+            tab_clicked = False
             try:
                 trade_button = page.locator('a.complex_link span:has-text("매물")')
                 await trade_button.click(timeout=10000)
                 await asyncio.sleep(2)
-                print(f"  ✓ 매물 탭 클릭 완료")
+                print("  ✓ 매물 탭 클릭 완료")
+                tab_clicked = True
             except Exception as e:
                 try:
                     await page.screenshot(path=f"snap_{self.complex_id}_tab_click_fail.png", full_page=True)
                 except Exception:
                     pass
                 print(f"  ⚠️  매물 탭 클릭 실패: {e}")
+                # ▶ 원본과 동일 동작: 탭 실패해도 선행 워밍업 스크롤 후 본 스크롤 루프 진입
+                await self._aggressive_warm_scroll(page)
             
-            # ▼ 스크롤 및 데이터 수집 (원본 그대로)
+            # (원본과 동일) 스크롤 및 데이터 수집
             max_scrolls = 100
             no_new_data_count = 0
             for scroll_num in range(max_scrolls):
                 previous_count = len(self.property_cards)
-                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                try:
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                except Exception:
+                    pass
+                # 추가로 휠/키보드 섞기(탭 실패 케이스에서 관성 유지)
+                if not tab_clicked and scroll_num < 6:
+                    try:
+                        await page.mouse.wheel(0, 1000)
+                        await page.keyboard.press("PageDown")
+                    except Exception:
+                        pass
+
                 await asyncio.sleep(1.5)
+
                 current_count = len(self.property_cards)
                 if current_count > previous_count:
                     no_new_data_count = 0
