@@ -3,6 +3,7 @@
 GitHub Actions용 네이버 부동산 크롤러
 매일 자동으로 여러 단지의 매물 정보를 수집하여 Google Sheets의
 '네이버 관심지역' 탭에 기록합니다.
+(원본 추출 흐름 유지: 탭 셀렉터/스크롤/파싱 로직은 변경 없음)
 """
 
 import asyncio
@@ -15,7 +16,7 @@ import time
 import gspread
 from google.oauth2 import service_account
 
-# 크롤링 대상 단지 목록
+# 크롤링 대상 단지 목록 (요청하신 관심지역 리스트)
 COMPLEXES = [
     {"id": "3833", "name": "남산타운"},
     {"id": "110938", "name": "e편한세상옥수파크힐스"},
@@ -78,7 +79,7 @@ def setup_google_sheets():
 
 
 class AggressiveCardScroll:
-    """네이버 부동산 매물 크롤러"""
+    """네이버 부동산 매물 크롤러 (원본 흐름 유지)"""
     
     def __init__(self, complex_id, complex_name):
         self.complex_id = complex_id
@@ -95,10 +96,9 @@ class AggressiveCardScroll:
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             )
-            
             page = await context.new_page()
             
-            # API 응답 캡처
+            # API 응답 캡처 (원본 그대로)
             async def handle_response(response):
                 if 'complexPyeongDetailList' in response.url or 'complexArticleList' in response.url:
                     try:
@@ -121,21 +121,72 @@ class AggressiveCardScroll:
             
             page.on('response', handle_response)
             
-            # 페이지 이동
+            # 페이지 이동 (원본) + ▼ 진입 실패(404/차단) 진단만 추가
             url = f"https://new.land.naver.com/complexes/{self.complex_id}?ms=37.4779802,127.0413966,16&a=APT&b=A1&e=RETAIL"
-            await page.goto(url, wait_until='networkidle', timeout=60000)
+            resp = await page.goto(url, wait_until='networkidle', timeout=60000)
+
+            # ▼ (추가) HTTP 상태/타이틀/본문 텍스트로 NotFound/차단 감지
+            status = None
+            try:
+                status = resp.status if resp else None
+            except Exception:
+                pass
+
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:
+                pass
+
+            if status and status >= 400:
+                try:
+                    await page.screenshot(path=f"snap_{self.complex_id}_http{status}.png", full_page=True)
+                except Exception:
+                    pass
+                print(f"  ❌ HTTP {status} (단지ID={self.complex_id}) → 이 단지는 건너뜀")
+                await context.close(); await browser.close()
+                return {
+                    'complex_name': self.complex_name,
+                    'property_count': 0,
+                    'properties': []
+                }
+
+            not_found_signals = ["페이지를 찾을 수 없습니다", "요청하신 페이지를 찾을 수 없습니다", "Page Not Found"]
+            body_text = ""
+            try:
+                body_text = (await page.inner_text("body")).strip()[:200]
+            except Exception:
+                pass
+
+            if any(s in (title or "") for s in not_found_signals) or any(s in body_text for s in not_found_signals):
+                try:
+                    await page.screenshot(path=f"snap_{self.complex_id}_notfound.png", full_page=True)
+                except Exception:
+                    pass
+                print(f"  ❌ NotFound/차단 의심 (title='{title}') → 이 단지는 건너뜀")
+                await context.close(); await browser.close()
+                return {
+                    'complex_name': self.complex_name,
+                    'property_count': 0,
+                    'properties': []
+                }
+
             await asyncio.sleep(3)
             
-            # 매물 탭 클릭
+            # 매물 탭 클릭 (원본 셀렉터 유지) + ▼ 실패 시 스냅샷만 추가
             try:
                 trade_button = page.locator('a.complex_link span:has-text("매물")')
                 await trade_button.click(timeout=10000)
                 await asyncio.sleep(2)
                 print(f"  ✓ 매물 탭 클릭 완료")
             except Exception as e:
+                try:
+                    await page.screenshot(path=f"snap_{self.complex_id}_tab_click_fail.png", full_page=True)
+                except Exception:
+                    pass
                 print(f"  ⚠️  매물 탭 클릭 실패: {e}")
             
-            # 스크롤 및 데이터 수집
+            # 스크롤 및 데이터 수집 (원본 그대로)
             max_scrolls = 100
             no_new_data_count = 0
             
@@ -169,7 +220,7 @@ class AggressiveCardScroll:
 
 
 def format_property_data(property_data):
-    """매물 데이터 포맷팅"""
+    """매물 데이터 포맷팅 (원본 그대로)"""
     raw_data = property_data.get('raw_data', {})
     
     # 면적 정보
