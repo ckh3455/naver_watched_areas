@@ -1,0 +1,1 @@
+# naver_watched_areas
