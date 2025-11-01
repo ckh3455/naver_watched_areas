@@ -121,59 +121,40 @@ class AggressiveCardScroll:
             
             page.on('response', handle_response)
             
-            # 페이지 이동 (원본) + ▼ 진입 실패(404/차단) 진단만 추가
+            # (원본) 페이지 이동
             url = f"https://new.land.naver.com/complexes/{self.complex_id}?ms=37.4779802,127.0413966,16&a=APT&b=A1&e=RETAIL"
             resp = await page.goto(url, wait_until='networkidle', timeout=60000)
 
-            # ▼ (추가) HTTP 상태/타이틀/본문 텍스트로 NotFound/차단 감지
-            status = None
+            # === [계측 추가] 원본 흐름 변경 없이, 진입 직후 상태만 로깅/스냅샷 ===
+            try:
+                ua = await page.evaluate("() => navigator.userAgent")
+            except Exception:
+                ua = "N/A"
+
             try:
                 status = resp.status if resp else None
             except Exception:
-                pass
+                status = None
 
-            title = ""
             try:
                 title = await page.title()
             except Exception:
-                pass
+                title = ""
 
-            if status and status >= 400:
-                try:
-                    await page.screenshot(path=f"snap_{self.complex_id}_http{status}.png", full_page=True)
-                except Exception:
-                    pass
-                print(f"  ❌ HTTP {status} (단지ID={self.complex_id}) → 이 단지는 건너뜀")
-                await context.close(); await browser.close()
-                return {
-                    'complex_name': self.complex_name,
-                    'property_count': 0,
-                    'properties': []
-                }
+            print(f"  [debug] after goto: url='{page.url}' status={status} title='{title}'")
+            print(f"  [debug] UA: {ua}")
 
-            not_found_signals = ["페이지를 찾을 수 없습니다", "요청하신 페이지를 찾을 수 없습니다", "Page Not Found"]
-            body_text = ""
             try:
-                body_text = (await page.inner_text("body")).strip()[:200]
+                if ("new.land.naver.com" not in page.url) or ("/complexes/" not in page.url):
+                    await page.screenshot(path=f"snap_{self.complex_id}_redirect.png", full_page=True)
+                    print("  [debug] redirected (saved snap)")
             except Exception:
                 pass
-
-            if any(s in (title or "") for s in not_found_signals) or any(s in body_text for s in not_found_signals):
-                try:
-                    await page.screenshot(path=f"snap_{self.complex_id}_notfound.png", full_page=True)
-                except Exception:
-                    pass
-                print(f"  ❌ NotFound/차단 의심 (title='{title}') → 이 단지는 건너뜀")
-                await context.close(); await browser.close()
-                return {
-                    'complex_name': self.complex_name,
-                    'property_count': 0,
-                    'properties': []
-                }
+            # === [계측 끝] 이후 로직은 원본 그대로 ===
 
             await asyncio.sleep(3)
             
-            # 매물 탭 클릭 (원본 셀렉터 유지) + ▼ 실패 시 스냅샷만 추가
+            # 매물 탭 클릭 (원본 셀렉터 유지) + 실패 시 스냅샷만 추가
             try:
                 trade_button = page.locator('a.complex_link span:has-text("매물")')
                 await trade_button.click(timeout=10000)
