@@ -24,33 +24,87 @@ jobs:
     - name: Python 의존성 설치
       run: |
         pip install -r requirements.txt
+        python -c "import sys; print('Python', sys.version)"
+        python -c "import gspread; import google.auth; print('gspread/google-auth OK')"
     
     - name: Playwright 브라우저 설치
       run: |
         playwright install chromium
         playwright install-deps chromium
     
-    - name: 서비스 계정 키 생성
+    - name: 서비스 계정 키 생성 (검증 포함)
+      env:
+        SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
       run: |
+        if [ -z "${SERVICE_ACCOUNT_JSON:-}" ]; then
+          echo "::error::Missing secret SERVICE_ACCOUNT_JSON"; exit 1;
+        fi
+
+        # 그대로 파일로 기록
         cat << 'EOF' > service_account.json
-        ${{ secrets.SERVICE_ACCOUNT_JSON }}
-        EOF
-        echo "서비스 계정 파일 생성 완료"
+${SERVICE_ACCOUNT_JSON}
+EOF
+
+        # 최소 유효성 검사
+        python - <<'PY'
+import json, sys
+try:
+    with open('service_account.json','r',encoding='utf-8') as f:
+        j=json.load(f)
+    for k in ('type','project_id','private_key','client_email'):
+        assert k in j, f"missing {k}"
+    print("service_account.json OK")
+except Exception as e:
+    print(f"::error::service_account.json invalid: {e}")
+    sys.exit(1)
+PY
         ls -lh service_account.json
     
-    - name: 크롤링 실행
+    - name: 스프레드시트 접근 프리플라이트
       env:
         SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
       run: |
-        python main_github.py
+        python - <<'PY'
+import os, sys, gspread
+from google.oauth2 import service_account
+sid = os.environ.get("SPREADSHEET_ID","").strip()
+creds = service_account.Credentials.from_service_account_file(
+    "service_account.json",
+    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+)
+gc = gspread.authorize(creds)
+try:
+    if sid:
+        ss = gc.open_by_key(sid)
+        try:
+            ss.worksheet("네이버 관심지역")
+            print("✅ 프리플라이트: '네이버 관심지역' 탭 접근 OK")
+        except gspread.WorksheetNotFound:
+            print("ℹ️ 프리플라이트: 워크시트 없음 → 실행 중 자동 생성 예정")
+    else:
+        print("::warning::SPREADSHEET_ID not set. 코드의 fallback ID 사용 예정")
+except Exception as e:
+    print(f"::error::스프레드시트 접근 실패: {e}")
+    sys.exit(1)
+PY
+
+    - name: 크롤링 실행
+      env:
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        PYTHONUNBUFFERED: "1"
+        TZ: Asia/Seoul
+      run: |
+        set -o pipefail
+        python main_github.py 2>&1 | tee run.log
     
-    - name: 크롤링 결과 업로드
+    - name: 결과/로그 업로드
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: crawling-results-${{ github.run_number }}
+        name: results-${{ github.run_number }}
         path: |
           crawling_results.json
+          run.log
         retention-days: 30
     
     - name: 정리
