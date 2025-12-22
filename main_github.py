@@ -371,58 +371,149 @@ class AggressiveCardScroll:
             except Exception as e:
                 debug_log(f"API 응답 파싱 실패: {url} - {str(e)}", "WARNING")
 
+    
+    def _extract_article_list(self, data):
+        """
+        API 응답 JSON에서 매물 리스트를 최대한 견고하게 추출한다.
+        (사이트/응답 래핑 구조 변경 대응)
+        """
+        if not isinstance(data, dict):
+            return []
+        # 1) 가장 흔한 구조
+        if isinstance(data.get("articleList"), list):
+            return data.get("articleList") or []
+
+        # 2) 래핑 케이스들
+        for path in (("body", "articleList"), ("result", "articleList"), ("data", "articleList")):
+            cur = data
+            ok = True
+            for k in path:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(cur, list):
+                return cur
+
+        # 3) key가 달라진 케이스(가능성 대응)
+        for k in ("articles", "articleLists", "list"):
+            v = data.get(k)
+            if isinstance(v, list) and v and isinstance(v[0], dict) and "articleNo" in v[0]:
+                return v
+
+        # 4) 재귀 탐색(최후 수단)
+        stack = [data]
+        visited = set()
+        while stack:
+            cur = stack.pop()
+            if id(cur) in visited:
+                continue
+            visited.add(id(cur))
+            if isinstance(cur, dict):
+                for kk, vv in cur.items():
+                    if kk == "articleList" and isinstance(vv, list):
+                        return vv
+                    if isinstance(vv, (dict, list)):
+                        stack.append(vv)
+            elif isinstance(cur, list):
+                for vv in cur:
+                    if isinstance(vv, (dict, list)):
+                        stack.append(vv)
+        return []
+
+    def _extract_more_flag(self, data):
+        """
+        isMoreData(또는 유사 플래그)를 다양한 구조에서 탐색한다.
+        없으면 None을 반환하여 호출부에서 휴리스틱으로 판단한다.
+        """
+        if not isinstance(data, dict):
+            return None
+
+        # 1) 직속
+        if "isMoreData" in data:
+            return bool(data.get("isMoreData"))
+
+        # 2) 래핑
+        for path in (("body", "isMoreData"), ("result", "isMoreData"), ("data", "isMoreData"),
+                     ("pagination", "isMoreData"), ("page", "isMoreData")):
+            cur = data
+            ok = True
+            for k in path:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok:
+                return bool(cur)
+
+        # 3) 재귀 탐색
+        stack = [data]
+        visited = set()
+        while stack:
+            cur = stack.pop()
+            if id(cur) in visited:
+                continue
+            visited.add(id(cur))
+            if isinstance(cur, dict):
+                if "isMoreData" in cur:
+                    return bool(cur.get("isMoreData"))
+                for vv in cur.values():
+                    if isinstance(vv, (dict, list)):
+                        stack.append(vv)
+            elif isinstance(cur, list):
+                for vv in cur:
+                    if isinstance(vv, (dict, list)):
+                        stack.append(vv)
+        return None
+
     async def extract_properties_from_response(self, data, url):
-        """
-        API 응답에서 매물 데이터 추출 (검증된 로직 유지)
-        단, (2번 파일) 추출 구조에 필요한 플래그(is_owner_flag)만 추가.
-        """
-        if isinstance(data, dict) and 'articleList' in data:
-            articles = data['articleList']
-            page_match = re.search(r'page=(\d+)', url)
-            page_num = page_match.group(1) if page_match else "Unknown"
+        """API 응답에서 매물 데이터 추출 (구조 변경 대응 + 페이지네이션 안정화)"""
+        articles = self._extract_article_list(data)
+        if not articles:
+            return False
 
-            debug_log(f"페이지 {page_num}에서 {len(articles)}개 매물 발견", "INFO")
+        page_match = re.search(r'page=(\d+)', url)
+        page_num = page_match.group(1) if page_match else "Unknown"
 
-            new_properties = 0
-            for article in articles:
-                if isinstance(article, dict):
-                    article_no = article.get('articleNo', '')
-                    if article_no and article_no not in self.unique_article_nos:
-                        self.unique_article_nos.add(article_no)
+        debug_log(f"페이지 {page_num}에서 {len(articles)}개 매물 발견", "INFO")
 
-                        # (2번 파일) 집주인 플래그: verificationTypeCode == OWNER
-                        verification = (article.get('verificationTypeCode') or "").strip().upper()
-                        is_owner_flag = (verification == "OWNER")
+        new_properties = 0
+        for article in articles:
+            if isinstance(article, dict):
+                article_no = article.get('articleNo', '')
+                if article_no and article_no not in self.unique_article_nos:
+                    self.unique_article_nos.add(article_no)
 
-                        property_data = {
-                            'complex_id': self.complex_id,
-                            'complex_name': self.complex_name,
-                            'article_no': article_no,
-                            'raw_data': article,
-                            'extracted_at': datetime.now().isoformat(),
-                            'card_number': len(self.property_cards) + 1,
-                            'page_number': page_num,
-                            'is_owner_flag': is_owner_flag,  # ✅ 추가
-                        }
-                        self.property_cards.append(property_data)
-                        new_properties += 1
+                    # 두번째 파일 추출구조: 집주인(OWNER) 여부 플래그
+                    is_owner = article.get('verificationTypeCode') == 'OWNER'
 
-                        # 주요 정보 추출
-                        dong = article.get('buildingName', '')
-                        trade_type = article.get('tradeTypeName', '')
-                        price = article.get('dealOrWarrantPrc', '')
+                    property_data = {
+                        'complex_id': self.complex_id,
+                        'complex_name': self.complex_name,
+                        'article_no': article_no,
+                        'raw_data': article,
+                        'extracted_at': datetime.now().isoformat(),
+                        'card_number': len(self.property_cards) + 1,
+                        'is_owner_flag': is_owner,
+                        'page_number': page_num
+                    }
+                    self.property_cards.append(property_data)
+                    new_properties += 1
 
-                        debug_log(f"  새 매물 #{len(self.property_cards)} (번호: {article_no}): {dong} - {trade_type} {price}", "DEBUG")
+        if new_properties > 0:
+            debug_log(f"  ➕ 페이지 {page_num}에서 {new_properties}개 매물 추가 (총 {len(self.property_cards)}개)", "SUCCESS")
 
-            if new_properties > 0:
-                debug_log(f"  ➕ {new_properties}개 새 매물 추가됨 (총 {len(self.property_cards)}개)", "SUCCESS")
+        # 핵심: 네이버 응답에서 isMoreData가 누락/변형되는 경우가 있어 휴리스틱 보강
+        more_flag = self._extract_more_flag(data)
+        if more_flag is not None:
+            return bool(more_flag)
 
-            # isMoreData 확인
-            is_more_data = data.get('isMoreData', False)
-            debug_log(f"  isMoreData: {is_more_data}", "DEBUG")
-            return is_more_data
-
-        return False
+        # 휴리스틱: (1) 이번 페이지에서 신규가 없으면 종료, (2) 반환 개수가 20(기본 페이지사이즈)면 다음 페이지 시도
+        if new_properties == 0:
+            return False
+        return len(articles) >= 20
 
     async def navigate_to_complex_page(self):
         """단지 페이지로 이동 (검증된 로직)"""
