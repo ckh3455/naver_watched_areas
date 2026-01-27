@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GitHub Actions용 네이버 부동산 크롤러 (검증된 로직 + 초상세 디버깅)
+GitHub Actions용 네이버 부동산 크롤러 (1번 기반 + 2번 추출방식 통합)
 
-중요: 기존(1번 스크립트) 동작은 그대로 유지하고,
-데이터 추출/포맷(2번 스크립트의 추출 형식)만 반영한 버전입니다.
+- 1번 스크립트: 구글시트/헤더/포맷/디버깅/단지목록/저장 구조 유지
+- 2번 스크립트: "상세매물검색" 진입 + 리스트 컨테이너 스크롤 + isMoreData 기반 수집 방식 적용
 """
 
 import asyncio
@@ -18,8 +18,7 @@ from google.oauth2 import service_account
 import traceback
 import urllib.parse
 
-
-# 22개 단지 목록 (2025-11 관심지역)
+# 31개 단지 목록
 COMPLEXES = [
     {"id": "3833", "name": "남산타운"},
     {"id": "950", "name": "행당대림"},
@@ -47,13 +46,12 @@ COMPLEXES = [
     {"id": "107014", "name": "일산요진와이시티(주거복합)"},
     {"id": "113065", "name": "부천 센트럴파크푸르지오(주상복합)"},
     {"id": "122109", "name": "힐스테이트중동(주상복합)"},
-     {"id": "107328", "name": "래미안부천중동"},
+    {"id": "107328", "name": "래미안부천중동"},
     {"id": "147880", "name": "안양역푸르지오더샵"},
     {"id": "175697", "name": "호계동 아크로베스티뉴"},
     {"id": "147229", "name": "힐스테이트구리역"},
-    {"id": "119652", "name": "동탄역롯데캐슬(주상복합)"}
+    {"id": "119652", "name": "동탄역롯데캐슬(주상복합)"},
 ]
-
 
 def debug_log(message, level="INFO"):
     """초상세 디버깅 로그"""
@@ -68,9 +66,8 @@ def debug_log(message, level="INFO"):
     }.get(level, "")
     print(f"[{timestamp}] {prefix} {message}")
 
-
 def setup_google_sheets():
-    """구글 시트 설정 (기존 1번 스크립트 방식 유지: service_account.json 사용)"""
+    """구글 시트 설정 (1번 방식 유지: service_account.json 사용)"""
     debug_log("=== 구글 시트 설정 시작 ===", "STEP")
 
     try:
@@ -91,7 +88,6 @@ def setup_google_sheets():
         )
         debug_log("서비스 계정 인증 완료", "SUCCESS")
 
-        # 실제 사용 중인 서비스 계정 이메일 출력
         service_email = credentials.service_account_email
         debug_log(f"🔑 사용 중인 서비스 계정: {service_email}", "INFO")
 
@@ -122,9 +118,8 @@ def setup_google_sheets():
         debug_log(f"상세 에러:\n{traceback.format_exc()}", "DEBUG")
         return None
 
-
 # ====================================================================
-# (2번 파일) 추출/포맷에 필요한 유틸 함수
+# (2번 추출/포맷 유틸)
 # ====================================================================
 
 def _truthy(val):
@@ -134,7 +129,6 @@ def _truthy(val):
         return False
     s = str(val).strip().lower()
     return s in ("true", "y", "1", "yes")
-
 
 def _to_int(val, default=0):
     try:
@@ -147,7 +141,6 @@ def _to_int(val, default=0):
     except Exception:
         return default
 
-
 def _id_or_empty(val):
     if val is None:
         return ""
@@ -158,11 +151,9 @@ def _id_or_empty(val):
     s = re.sub(r"[^A-Za-z0-9._-]", "", s)
     return s
 
-
 def _to_text_cell(val):
     s = _id_or_empty(val)
     return f"'{s}" if s else ""
-
 
 def _extract_realtor_id(raw):
     candidate_keys = (
@@ -199,7 +190,6 @@ def _extract_realtor_id(raw):
             pass
     return ""
 
-
 def _has_photos(raw):
     for k in ("siteImageCount", "representativeImageCount", "imageCount"):
         if k in raw and _to_int(raw.get(k), 0) > 0:
@@ -208,7 +198,6 @@ def _has_photos(raw):
         if k in raw and _truthy(raw.get(k)):
             return True
     return False
-
 
 def _parse_price_number(s):
     if s is None:
@@ -226,7 +215,6 @@ def _parse_price_number(s):
         return int(float(t.replace(",", "").replace("만", "")))
     except Exception:
         return None
-
 
 def _resolve_price_change(raw):
     v = raw.get("priceChangeState")
@@ -285,9 +273,12 @@ def _resolve_price_change(raw):
 
     return "변동"
 
+# ====================================================================
+# 2번 방식(컨테이너 스크롤 + isMoreData) 적용 크롤러
+# ====================================================================
 
 class AggressiveCardScroll:
-    """검증된 네이버 부동산 매물 크롤러 (원본 로직 유지)"""
+    """네이버 부동산 매물 크롤러 (2번 추출 방식 적용)"""
 
     def __init__(self, complex_id, complex_name):
         debug_log(f"크롤러 초기화: {complex_name} (ID: {complex_id})", "DEBUG")
@@ -298,6 +289,7 @@ class AggressiveCardScroll:
         self.unique_article_nos = set()
         self.page = None
         self.api_responses = []
+        self.more_data = True
         debug_log(f"크롤러 초기화 완료. URL: {self.base_url}", "SUCCESS")
 
     async def setup_playwright(self):
@@ -305,11 +297,8 @@ class AggressiveCardScroll:
         debug_log("=== Playwright 환경 설정 시작 ===", "STEP")
 
         try:
-            debug_log("Playwright 인스턴스 시작...", "DEBUG")
             self.playwright = await async_playwright().start()
-            debug_log("Playwright 인스턴스 시작 완료", "SUCCESS")
 
-            debug_log("Chromium 브라우저 실행 중...", "DEBUG")
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
                 args=[
@@ -322,9 +311,7 @@ class AggressiveCardScroll:
                     '--window-size=1920,1080'
                 ]
             )
-            debug_log("브라우저 실행 완료", "SUCCESS")
 
-            debug_log("브라우저 컨텍스트 생성 중...", "DEBUG")
             self.context = await self.browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -337,12 +324,10 @@ class AggressiveCardScroll:
                     'Upgrade-Insecure-Requests': '1',
                 }
             )
-            debug_log("브라우저 컨텍스트 생성 완료", "SUCCESS")
 
-            debug_log("새 페이지 생성 중...", "DEBUG")
             self.page = await self.context.new_page()
             self.page.on('response', self.handle_response)
-            debug_log("새 페이지 생성 완료 및 응답 리스너 등록", "SUCCESS")
+            debug_log("Playwright 설정 완료 + 응답 리스너 등록", "SUCCESS")
 
         except Exception as e:
             debug_log(f"Playwright 설정 실패: {str(e)}", "ERROR")
@@ -350,10 +335,8 @@ class AggressiveCardScroll:
             raise
 
     async def handle_response(self, response):
-        """API 응답 모니터링 (검증된 로직)"""
+        """매물 관련 API 응답만 저장/추출"""
         url = response.url
-
-        # 매물 관련 API 응답만 저장
         if 'api/articles/complex' in url and 'page=' in url:
             try:
                 debug_log(f"API 응답 감지: {url}", "DEBUG")
@@ -363,27 +346,16 @@ class AggressiveCardScroll:
                     'data': data,
                     'timestamp': datetime.now().isoformat()
                 })
-                debug_log(f"API 응답 저장 완료 (총 {len(self.api_responses)}개)", "DEBUG")
-
-                # 매물 데이터 추출
                 await self.extract_properties_from_response(data, url)
-
             except Exception as e:
                 debug_log(f"API 응답 파싱 실패: {url} - {str(e)}", "WARNING")
 
-    
     def _extract_article_list(self, data):
-        """
-        API 응답 JSON에서 매물 리스트를 최대한 견고하게 추출한다.
-        (사이트/응답 래핑 구조 변경 대응)
-        """
+        """(안전장치) articleList 구조 변화 대응"""
         if not isinstance(data, dict):
             return []
-        # 1) 가장 흔한 구조
         if isinstance(data.get("articleList"), list):
             return data.get("articleList") or []
-
-        # 2) 래핑 케이스들
         for path in (("body", "articleList"), ("result", "articleList"), ("data", "articleList")):
             cur = data
             ok = True
@@ -395,81 +367,10 @@ class AggressiveCardScroll:
                     break
             if ok and isinstance(cur, list):
                 return cur
-
-        # 3) key가 달라진 케이스(가능성 대응)
-        for k in ("articles", "articleLists", "list"):
-            v = data.get(k)
-            if isinstance(v, list) and v and isinstance(v[0], dict) and "articleNo" in v[0]:
-                return v
-
-        # 4) 재귀 탐색(최후 수단)
-        stack = [data]
-        visited = set()
-        while stack:
-            cur = stack.pop()
-            if id(cur) in visited:
-                continue
-            visited.add(id(cur))
-            if isinstance(cur, dict):
-                for kk, vv in cur.items():
-                    if kk == "articleList" and isinstance(vv, list):
-                        return vv
-                    if isinstance(vv, (dict, list)):
-                        stack.append(vv)
-            elif isinstance(cur, list):
-                for vv in cur:
-                    if isinstance(vv, (dict, list)):
-                        stack.append(vv)
         return []
 
-    def _extract_more_flag(self, data):
-        """
-        isMoreData(또는 유사 플래그)를 다양한 구조에서 탐색한다.
-        없으면 None을 반환하여 호출부에서 휴리스틱으로 판단한다.
-        """
-        if not isinstance(data, dict):
-            return None
-
-        # 1) 직속
-        if "isMoreData" in data:
-            return bool(data.get("isMoreData"))
-
-        # 2) 래핑
-        for path in (("body", "isMoreData"), ("result", "isMoreData"), ("data", "isMoreData"),
-                     ("pagination", "isMoreData"), ("page", "isMoreData")):
-            cur = data
-            ok = True
-            for k in path:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    ok = False
-                    break
-            if ok:
-                return bool(cur)
-
-        # 3) 재귀 탐색
-        stack = [data]
-        visited = set()
-        while stack:
-            cur = stack.pop()
-            if id(cur) in visited:
-                continue
-            visited.add(id(cur))
-            if isinstance(cur, dict):
-                if "isMoreData" in cur:
-                    return bool(cur.get("isMoreData"))
-                for vv in cur.values():
-                    if isinstance(vv, (dict, list)):
-                        stack.append(vv)
-            elif isinstance(cur, list):
-                for vv in cur:
-                    if isinstance(vv, (dict, list)):
-                        stack.append(vv)
-        return None
-
     async def extract_properties_from_response(self, data, url):
-        """API 응답에서 매물 데이터 추출 (구조 변경 대응 + 페이지네이션 안정화)"""
+        """API 응답에서 매물 데이터 추출 + isMoreData 갱신"""
         articles = self._extract_article_list(data)
         if not articles:
             return False
@@ -486,7 +387,6 @@ class AggressiveCardScroll:
                 if article_no and article_no not in self.unique_article_nos:
                     self.unique_article_nos.add(article_no)
 
-                    # 두번째 파일 추출구조: 집주인(OWNER) 여부 플래그
                     is_owner = article.get('verificationTypeCode') == 'OWNER'
 
                     property_data = {
@@ -505,54 +405,60 @@ class AggressiveCardScroll:
         if new_properties > 0:
             debug_log(f"  ➕ 페이지 {page_num}에서 {new_properties}개 매물 추가 (총 {len(self.property_cards)}개)", "SUCCESS")
 
-        # 핵심: 네이버 응답에서 isMoreData가 누락/변형되는 경우가 있어 휴리스틱 보강
-        more_flag = self._extract_more_flag(data)
-        if more_flag is not None:
-            return bool(more_flag)
+        # 2번 방식: isMoreData 기반 루프 컨트롤
+        if isinstance(data, dict) and "isMoreData" in data:
+            self.more_data = bool(data.get("isMoreData", False))
+            debug_log(f"  📄 isMoreData: {self.more_data}", "DEBUG")
+        else:
+            # 안전장치: isMoreData가 없으면 페이지사이즈 기반(보통 20)으로 추정
+            self.more_data = (new_properties > 0 and len(articles) >= 20)
+            debug_log(f"  📄 isMoreData 없음 → 휴리스틱 more_data={self.more_data}", "DEBUG")
 
-        # 휴리스틱: (1) 이번 페이지에서 신규가 없으면 종료, (2) 반환 개수가 20(기본 페이지사이즈)면 다음 페이지 시도
-        if new_properties == 0:
-            return False
-        return len(articles) >= 20
+        return self.more_data
 
     async def navigate_to_complex_page(self):
-        """단지 페이지로 이동 (검증된 로직)"""
+        """단지 페이지로 이동 + 상세매물검색 진입(2번 방식)"""
         debug_log("=== 단지 페이지 이동 시작 ===", "STEP")
         debug_log(f"대상 URL: {self.base_url}", "INFO")
 
         try:
-            debug_log("페이지 로드 시도 (타임아웃: 60초)...", "DEBUG")
-            await self.page.goto(self.base_url, wait_until='networkidle', timeout=60000)
-            debug_log("페이지 로드 완료", "SUCCESS")
+            await self.page.goto(self.base_url, wait_until='domcontentloaded', timeout=60000)
+            debug_log("페이지 로드 완료(domcontentloaded)", "SUCCESS")
+            await asyncio.sleep(3)
 
-            debug_log("초기 대기 (2초)...", "DEBUG")
-            await asyncio.sleep(2)
-
-            # 페이지 상태 확인
             title = await self.page.title()
             debug_log(f"페이지 제목: {title}", "INFO")
 
-            # 매물/시세 탭 클릭
+            # 2번 방식: "상세매물검색" 버튼 클릭 시도
+            debug_log("상세매물검색 버튼 클릭 시도...", "DEBUG")
             try:
-                debug_log("'매물/시세' 탭 클릭 시도...", "DEBUG")
-                await self.page.click('text="매물/시세"', timeout=5000)
-                debug_log("'매물/시세' 탭 클릭 성공", "SUCCESS")
-                await asyncio.sleep(3)
+                clicked = await self.page.evaluate("""
+                    () => {
+                        const btn = Array.from(document.querySelectorAll('button'))
+                          .find(b => (b.innerText || '').includes('상세매물검색'));
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    debug_log("✅ 상세매물검색 버튼 클릭 성공", "SUCCESS")
+                    await asyncio.sleep(2)
+                else:
+                    debug_log("⚠️ 상세매물검색 버튼을 찾지 못함 (이미 활성화/구조변경 가능)", "WARNING")
             except Exception as e:
-                debug_log(f"'매물/시세' 탭 클릭 실패: {str(e)}", "WARNING")
+                debug_log(f"상세매물검색 버튼 클릭 중 오류: {str(e)}", "WARNING")
 
-            # 실거래가 탭 클릭
+            # 최초 매물 API 한번 기다려 보기(있으면 바로 캐치됨)
             try:
-                debug_log("'실거래가' 탭 클릭 시도...", "DEBUG")
-                await self.page.click('text="실거래가"', timeout=5000)
-                debug_log("'실거래가' 탭 클릭 성공", "SUCCESS")
-                await asyncio.sleep(3)
-            except Exception as e:
-                debug_log(f"'실거래가' 탭 클릭 실패: {str(e)}", "WARNING")
+                await self.page.wait_for_response(
+                    lambda r: ('api/articles/complex' in r.url and 'page=' in r.url),
+                    timeout=5000
+                )
+                debug_log("📡 초기 매물 API 응답 감지", "SUCCESS")
+            except Exception:
+                debug_log("⚠️ 초기 매물 API 응답 대기 타임아웃(스크롤로 유도 예정)", "WARNING")
 
-            # 최종 URL 확인
-            current_url = self.page.url
-            debug_log(f"현재 URL: {current_url}", "INFO")
+            debug_log(f"현재 URL: {self.page.url}", "INFO")
 
         except Exception as e:
             debug_log(f"페이지 로드 실패: {str(e)}", "ERROR")
@@ -560,89 +466,135 @@ class AggressiveCardScroll:
             raise
 
     async def aggressive_scroll(self):
-        """적극적인 스크롤 (검증된 로직)"""
-        debug_log("=== 적극적인 스크롤 시작 ===", "STEP")
+        """2번 방식: 매물 리스트 컨테이너 스크롤 + isMoreData 기반 반복"""
+        debug_log("=== 스크롤 컨테이너 방식 스크롤 시작 ===", "STEP")
 
-        consecutive_no_change = 0
+        last_height = 0
+        no_height_change_count = 0
+        MAX_NO_CHANGE = 3
+        scroll_attempts = 0
 
-        for i in range(30):  # 최대 30번 스크롤
-            debug_log(f"--- 스크롤 라운드 {i+1}/30 ---", "STEP")
+        # 컨테이너 셀렉터 후보(AB 테스트/클래스 변경 대비)
+        container_selectors = [
+            ".item_list--article",
+            "[class*='item_list'][class*='article']",
+            ".item_list",
+            "[data-testid*='article']",
+        ]
 
-            # 현재 매물 수 기록
-            current_count = len(self.property_cards)
-            debug_log(f"현재 수집된 매물: {current_count}개", "INFO")
+        while self.more_data:
+            prev_count = len(self.property_cards)
 
+            # 컨테이너 상태 조회
             try:
-                # 다양한 스크롤 방법 시도
-                scroll_methods = [
-                    "window.scrollTo(0, document.body.scrollHeight);",
-                    "window.scrollBy(0, 1000);",
-                    "window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});",
-                    """
-                    const articleList = document.querySelector('[class*="article"]') ||
-                                      document.querySelector('.item_list') ||
-                                      document.querySelector('[data-testid*="article"]') ||
-                                      document.querySelector('.list_area');
-                    if (articleList) {
-                        articleList.scrollTop = articleList.scrollHeight;
-                    }
-                    """,
-                    """
-                    const scrollContainers = document.querySelectorAll('[style*="overflow"], [class*="scroll"]');
-                    scrollContainers.forEach(container => {
-                        if (container.scrollHeight > container.clientHeight) {
-                            container.scrollTop = container.scrollHeight;
-                        }
-                    });
-                    """
-                ]
+                container_state = await self.page.evaluate(
+                    """(selectors) => {
+                        const pick = () => {
+                          for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.scrollHeight && el.clientHeight) return {sel, el};
+                          }
+                          return null;
+                        };
+                        const p = pick();
+                        if (!p) return { success: false };
+                        const el = p.el;
+                        return {
+                            success: true,
+                            selector: p.sel,
+                            scrollHeight: el.scrollHeight,
+                            scrollTop: el.scrollTop,
+                            clientHeight: el.clientHeight
+                        };
+                    }""",
+                    container_selectors
+                )
 
-                debug_log(f"JavaScript 스크롤 실행 ({len(scroll_methods)}개 방법)...", "DEBUG")
-                for method in scroll_methods:
-                    await self.page.evaluate(method)
-                    await asyncio.sleep(0.2)
+                if not container_state.get("success"):
+                    debug_log("⚠️ 스크롤 컨테이너를 찾지 못함 → 스크롤 종료", "WARNING")
+                    break
 
-                debug_log("마우스 휠 스크롤 실행...", "DEBUG")
-                await self.page.mouse.wheel(0, 2000)
-                await asyncio.sleep(0.3)
+                sel = container_state.get("selector")
+                current_height = container_state['scrollHeight']
+                is_at_bottom = (container_state['scrollTop'] + container_state['clientHeight']) >= (current_height - 10)
 
-                debug_log("키보드 스크롤 실행...", "DEBUG")
-                await self.page.keyboard.press('End')
-                await asyncio.sleep(0.2)
+                if current_height == last_height and is_at_bottom:
+                    no_height_change_count += 1
+                    debug_log(f"⚠️ 컨테이너 높이 변화 없음 ({no_height_change_count}/{MAX_NO_CHANGE}) sel={sel}", "WARNING")
 
-                for _ in range(3):
-                    await self.page.keyboard.press('PageDown')
-                    await asyncio.sleep(0.1)
+                    if no_height_change_count >= MAX_NO_CHANGE:
+                        if not self.more_data:
+                            debug_log("⏹️ isMoreData=False + 높이 변화 없음 → 종료", "INFO")
+                            break
+                        else:
+                            debug_log("⚠️ 높이 변화 없지만 isMoreData=True → 8초 추가 대기 후 재시도", "WARNING")
+                            await asyncio.sleep(8)
+                            no_height_change_count = 0
+                else:
+                    no_height_change_count = 0
+                    if current_height > last_height:
+                        debug_log(f"📈 컨테이너 확장: {last_height} → {current_height} (+{current_height - last_height}px) sel={sel}", "SUCCESS")
+                    last_height = current_height
 
-                for _ in range(5):
-                    await self.page.keyboard.press('ArrowDown')
-                    await asyncio.sleep(0.05)
+                # 실제 스크롤 수행
+                scroll_result = await self.page.evaluate(
+                    """(selectors) => {
+                        const pick = () => {
+                          for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.scrollHeight && el.clientHeight) return el;
+                          }
+                          return null;
+                        };
+                        const el = pick();
+                        if (!el) return { success: false };
+                        const before = el.scrollTop;
+                        el.scrollTop += 1200;
+                        const after = el.scrollTop;
+                        const denom = (el.scrollHeight - el.clientHeight) || 1;
+                        return {
+                            success: true,
+                            scrolled: after - before,
+                            progress: ((after / denom) * 100).toFixed(1)
+                        };
+                    }""",
+                    container_selectors
+                )
+
+                scroll_attempts += 1
+                if scroll_result.get("success"):
+                    debug_log(f"🔄 [{scroll_attempts}] 스크롤: {scroll_result['scrolled']}px (진행률: {scroll_result['progress']}%)", "DEBUG")
+                else:
+                    debug_log(f"⚠️ [{scroll_attempts}] 스크롤 실패", "WARNING")
+
+                # 응답 대기(있으면 빠르게 반응)
+                try:
+                    await self.page.wait_for_response(
+                        lambda r: ('api/articles/complex' in r.url and 'page=' in r.url),
+                        timeout=3000
+                    )
+                    debug_log("📡 API 응답 감지!", "SUCCESS")
+                except Exception:
+                    pass
+
+                await asyncio.sleep(1.2)
+
+                if len(self.property_cards) > prev_count:
+                    added = len(self.property_cards) - prev_count
+                    debug_log(f"🎉 새 매물 {added}개 추가! (총 {len(self.property_cards)}개)", "SUCCESS")
+
+                # 안전중단
+                if scroll_attempts >= 180:
+                    debug_log(f"⛔ 안전중단: 180회 스크롤 시도 초과 (총 {len(self.property_cards)}개 수집)", "WARNING")
+                    break
 
             except Exception as e:
                 debug_log(f"스크롤 중 오류: {str(e)}", "WARNING")
+                await asyncio.sleep(2)
 
-            # 새로운 매물 확인
-            new_count = len(self.property_cards)
-            if new_count > current_count:
-                added = new_count - current_count
-                debug_log(f"🎉 새로운 매물 {added}개 추가됨! (총 {new_count}개)", "SUCCESS")
-                consecutive_no_change = 0
-            else:
-                consecutive_no_change += 1
-                debug_log(f"새로운 매물 없음 (연속 {consecutive_no_change}회)", "WARNING")
-
-            debug_log(f"총 API 응답: {len(self.api_responses)}개", "INFO")
-
-            # 3번 연속 변화 없으면 중단
-            if consecutive_no_change >= 3:
-                debug_log(f"⏹️  연속 {consecutive_no_change}회 변화 없음. 스크롤 종료", "INFO")
-                break
-
-            debug_log("대기 (0.5초)...", "DEBUG")
-            await asyncio.sleep(0.5)
+        debug_log(f"✅ 스크롤 완료 (총 {len(self.property_cards)}개 수집, {scroll_attempts}회 시도)", "SUCCESS")
 
     async def close_browser(self):
-        """브라우저 종료"""
         debug_log("브라우저 종료 중...", "DEBUG")
         try:
             if hasattr(self, 'browser'):
@@ -655,7 +607,7 @@ class AggressiveCardScroll:
             debug_log(f"브라우저 종료 중 오류: {str(e)}", "WARNING")
 
     async def run(self):
-        """크롤러 실행 (검증된 로직)"""
+        """크롤러 실행"""
         debug_log(f"\n{'='*70}", "STEP")
         debug_log(f"🏢 {self.complex_name} 크롤링 시작", "STEP")
         debug_log(f"{'='*70}", "STEP")
@@ -686,10 +638,13 @@ class AggressiveCardScroll:
             await self.close_browser()
             raise
 
+# ====================================================================
+# 21열 포맷(1번 유지)
+# ====================================================================
 
 def format_property_data(property_data):
     """
-    (2번 파일) 추출/포맷 구조 적용: 21열 반환
+    21열 반환
 
     [단지명, 거래구분, 동, 층수, 면적, 가격,
      가격변동, 중복업소,
@@ -769,11 +724,13 @@ def format_property_data(property_data):
         certification_ad                                     # 인증광고
     ]
 
+# ====================================================================
+# main (1번 유지)
+# ====================================================================
 
 async def main():
-    """메인 실행 함수"""
     print("\n" + "="*70)
-    print("🚀 네이버 부동산 크롤러 시작")
+    print("🚀 네이버 부동산 크롤러 시작 (1번 기반 + 2번 추출방식)")
     print(f"⏰ 시작시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*70 + "\n")
 
@@ -786,11 +743,9 @@ async def main():
 
     # 기존 데이터 삭제 및 헤더 추가
     debug_log("=== 2단계: 시트 초기화 ===", "STEP")
-    debug_log("기존 데이터 삭제 중...", "DEBUG")
     worksheet.clear()
     debug_log("기존 데이터 삭제 완료", "SUCCESS")
 
-    # (2번 파일) 21열 헤더 적용
     headers = [
         "단지명", "거래구분", "동", "층수", "면적", "가격",
         "가격변동", "중복업소",
@@ -800,7 +755,6 @@ async def main():
         "사진 유무", "경도", "위도", "매물번호",
         "인증광고"
     ]
-    debug_log(f"헤더 추가 중: {headers}", "DEBUG")
     worksheet.append_row(headers)
     debug_log("헤더 추가 완료", "SUCCESS")
 
@@ -810,7 +764,6 @@ async def main():
     all_properties = []
     total_start_time = time.time()
 
-    # 22개 단지 순회
     for idx, complex_info in enumerate(COMPLEXES, 1):
         debug_log(f"\n{'#'*70}", "STEP")
         debug_log(f"📍 진행: [{idx}/{len(COMPLEXES)}] {complex_info['name']}", "STEP")
@@ -822,13 +775,10 @@ async def main():
             crawler = AggressiveCardScroll(complex_info['id'], complex_info['name'])
             result = await crawler.run()
 
-            complex_end_time = time.time()
-            complex_duration = complex_end_time - complex_start_time
-
+            complex_duration = time.time() - complex_start_time
             property_count = result['property_count']
             debug_log(f"✅ {complex_info['name']} 완료: {property_count}개 매물 ({complex_duration:.1f}초)", "SUCCESS")
 
-            # 데이터 포맷팅
             if result.get('properties'):
                 debug_log(f"데이터 포맷팅 중... ({len(result['properties'])}개)", "DEBUG")
                 for property_data in result['properties']:
@@ -844,9 +794,7 @@ async def main():
             })
 
         except Exception as e:
-            complex_end_time = time.time()
-            complex_duration = complex_end_time - complex_start_time
-
+            complex_duration = time.time() - complex_start_time
             debug_log(f"❌ {complex_info['name']} 실패: {str(e)} ({complex_duration:.1f}초)", "ERROR")
             debug_log(f"상세 에러:\n{traceback.format_exc()}", "DEBUG")
 
@@ -858,7 +806,6 @@ async def main():
                 'error': str(e)
             })
 
-        # 다음 단지 실행 전 대기
         if idx < len(COMPLEXES):
             debug_log("다음 단지까지 5초 대기...", "DEBUG")
             await asyncio.sleep(5)
@@ -873,8 +820,7 @@ async def main():
         debug_log("기록할 매물 데이터가 없습니다", "WARNING")
 
     # 전체 결과 요약
-    total_end_time = time.time()
-    total_duration = total_end_time - total_start_time
+    total_duration = time.time() - total_start_time
 
     successful = [r for r in results if r['status'] == 'success']
     failed = [r for r in results if r['status'] == 'error']
@@ -890,7 +836,6 @@ async def main():
     print(f"🏠 총 매물 수: {total_properties}개")
     print("="*70)
 
-    # 단지별 상세 결과
     print("\n📋 단지별 상세 결과:")
     print("-"*70)
     for i, result in enumerate(results, 1):
@@ -904,7 +849,7 @@ async def main():
         'total_duration_seconds': total_duration,
         'total_duration_minutes': total_duration/60,
         'start_time': datetime.fromtimestamp(total_start_time).strftime('%Y-%m-%d %H:%M:%S'),
-        'end_time': datetime.fromtimestamp(total_end_time).strftime('%Y-%m-%d %H:%M:%S'),
+        'end_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'successful_count': len(successful),
         'failed_count': len(failed),
         'total_properties': total_properties,
